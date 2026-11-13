@@ -9,7 +9,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "data/data_peer.h"
 #include "dialogs/ui/dialogs_message_view.h"
-#include "history/view/media/history_view_html_widget.h"
 #include "history/view/media/history_view_unsupported_widget.h"
 #include "history/view/history_view_item_preview.h"
 #include "history/history.h"
@@ -237,16 +236,7 @@ std::unique_ptr<HistoryView::Media> WidgetMedia::createView(
 		not_null<HistoryView::Element*> message,
 		not_null<HistoryItem*> realParent,
 		HistoryView::Element *replacing) {
-	const auto &html = this->html();
-	if (!html.isEmpty()) {
-		return std::make_unique<HistoryView::HtmlWidget>(
-			message,
-			realParent,
-			_fields.anchors,
-			html,
-			context(),
-			replacing);
-	}
+	// Bot HTML widgets are disabled in this fork.
 	return std::make_unique<HistoryView::UnsupportedWidget>(message);
 }
 

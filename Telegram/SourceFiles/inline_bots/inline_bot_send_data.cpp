@@ -219,7 +219,7 @@ SendWidget::SendWidget(
 }
 
 bool SendWidget::isValid() const {
-	return true;
+	return false;
 }
 
 SendDataCommon::SentMessageFields SendWidget::getSentMessageFields() const {
