@@ -193,7 +193,8 @@ jobs:
           nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
           nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
       - name: Dependencies cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        id: windows-dependencies
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             Libraries
@@ -202,6 +203,15 @@ jobs:
       - name: Build dependencies for Debug and Release
         shell: cmd
         run: call tdesktop\Telegram\build\prepare\win.bat silent qt6
+      - name: Save completed dependencies before compiling the application
+        if: steps.windows-dependencies.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            Libraries
+            ThirdParty
+          key: ${{ steps.windows-dependencies.outputs.cache-primary-key }}
       - name: Build Release
         shell: cmd
         run: |
@@ -214,7 +224,8 @@ jobs:
             -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
             -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
           if errorlevel 1 exit /b 1
-          cmake --build ..\out --config Release --parallel
+          rem Bound both MSBuild projects and per-project /MP compiler processes.
+          cmake --build ..\out --config Release --parallel 1 -- /p:CL_MPCount=2
       - name: Package Windows
         shell: pwsh
         run: |
