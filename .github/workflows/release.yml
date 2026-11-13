@@ -130,12 +130,63 @@ jobs:
           echo "SDK=$sdk" >> "$GITHUB_ENV"
           git config --global user.email 'build@users.noreply.github.com'
           git config --global user.name 'Release build'
+      - name: Install ATL for the pinned MSVC toolset
+        shell: pwsh
+        run: |
+          $installer = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
+          $vswhere = Join-Path $installer 'vswhere.exe'
+          $setup = Join-Path $installer 'setup.exe'
+          if (-not (Test-Path $vswhere) -or -not (Test-Path $setup)) {
+            throw "Visual Studio Installer is incomplete at $installer."
+          }
+
+          $toolsComponent = 'Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64'
+          $atlComponent = 'Microsoft.VisualStudio.Component.VC.14.44.17.14.ATL'
+          $path = @(& $vswhere -latest -products '*' -requires $toolsComponent -property installationPath)[0]
+          if (-not $path) {
+            throw "No Visual Studio instance provides $toolsComponent."
+          }
+
+          $toolset = Get-ChildItem (Join-Path $path 'VC\Tools\MSVC') -Directory `
+            | Where-Object { $_.Name -like '14.44.*' } `
+            | Sort-Object Name -Descending `
+            | Select-Object -First 1
+          if (-not $toolset) {
+            throw "The selected Visual Studio instance has no 14.44 toolset."
+          }
+          $header = Join-Path $toolset.FullName 'atlmfc\include\atlbase.h'
+          if (-not (Test-Path $header)) {
+            $process = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+              'modify',
+              '--installPath', "`"$path`"",
+              '--add', $atlComponent,
+              '--quiet', '--norestart', '--nocache'
+            )
+            if ($process.ExitCode -notin @(0, 3010)) {
+              throw "Visual Studio Installer exited with $($process.ExitCode)."
+            }
+          }
+          if (-not (Test-Path $header)) {
+            throw "$atlComponent did not install $header."
+          }
       - name: Native tools
         uses: Eden-CI/msvc-dev-cmd@1bd71f95d6f3d1b2b3395b335cc63bcdc90cf223
         with:
           arch: x64
           sdk: ${{ env.SDK }}
           toolset: '14.44'
+      - name: Verify ATL headers in the selected toolset
+        shell: pwsh
+        run: |
+          $atlInclude = Join-Path $env:VCToolsInstallDir 'atlmfc\include'
+          foreach ($header in @('atlbase.h', 'atlcomcli.h')) {
+            if (-not (Test-Path (Join-Path $atlInclude $header))) {
+              throw "The selected toolset has no $header in $atlInclude."
+            }
+          }
+          if (($env:INCLUDE -split ';') -notcontains $atlInclude) {
+            throw "The selected toolset did not add $atlInclude to INCLUDE."
+          }
       - name: NuGet sources
         shell: cmd
         run: |
@@ -221,7 +272,7 @@ jobs:
           cmake --build ../out --config Release --parallel
       - name: Package macOS
         run: |
-          lipo -verify_arch x86_64 arm64 tdesktop/out/Release/Telegram.app/Contents/MacOS/Telegram
+          lipo tdesktop/out/Release/Telegram.app/Contents/MacOS/Telegram -verify_arch x86_64 arm64
           mkdir -p dist
           ditto -c -k --sequesterRsrc --keepParent tdesktop/out/Release/Telegram.app dist/tdesktop-without-widgets-macos-universal.zip
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
