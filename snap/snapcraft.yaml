@@ -66,7 +66,11 @@ parts:
         version="$version-beta"
       fi
 
-      version="${version}$(git describe --tags | sed 's,^v[^-]\+,,')"
+      if description=$(git describe --tags 2>/dev/null); then
+        version="${version}$(printf '%s' "$description" | sed 's,^v[^-]\+,,')"
+      else
+        version="${version}-g$(git rev-parse --short HEAD)"
+      fi
 
       craftctl set version="$version"
     override-build: |
