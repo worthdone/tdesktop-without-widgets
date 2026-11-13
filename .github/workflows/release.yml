@@ -1,0 +1,276 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (empty uses the app version and run number)
+        type: string
+        required: false
+      prerelease:
+        description: Mark the release as a prerelease
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Public credentials already used by this repository's nightly builds.
+  TDESKTOP_API_ID: '611335'
+  TDESKTOP_API_HASH: d524b414d21f4d37f08684c1df41ac9c
+
+jobs:
+  version:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Choose an unused release tag
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(awk '$1 == "AppVersionStr" { print $2 }' Telegram/build/version)
+          tag=${REQUESTED_TAG:-v${version}-without-widgets.${GITHUB_RUN_NUMBER}}
+          git check-ref-format "refs/tags/$tag"
+          if [[ "$tag" == -* || "$tag" == *$'\n'* || "$tag" == *$'\r'* ]]; then
+            echo 'Invalid release tag.' >&2
+            exit 1
+          fi
+          # Fail on API errors, and never replace an existing tag or release.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/" > "$RUNNER_TEMP/tags.json"
+          if jq -e --arg ref "refs/tags/$tag" '.[] | select(.ref == $ref)' "$RUNNER_TEMP/tags.json" > /dev/null; then
+            echo "Tag $tag already exists." >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: Linux x64
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+      - name: Generate dependency image
+        run: |
+          python3 -m venv "$RUNNER_TEMP/docker-generator"
+          "$RUNNER_TEMP/docker-generator/bin/pip" install jinja2
+          cd Telegram/build/docker/centos_env
+          DEBUG= LTO= "$RUNNER_TEMP/docker-generator/bin/python" gen_dockerfile.py > "$RUNNER_TEMP/Dockerfile"
+          mv "$RUNNER_TEMP/Dockerfile" Dockerfile
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6
+        with:
+          tool-cache: true
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Build dependencies
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: Telegram/build/docker/centos_env
+          load: true
+          tags: tdesktop:release
+          cache-from: type=gha,scope=release-linux
+          cache-to: type=gha,scope=release-linux,mode=max
+      - name: Build Release
+        run: |
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -v "$PWD:/usr/src/tdesktop" \
+            -e CONFIG=Release \
+            tdesktop:release \
+            /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh \
+            -D CMAKE_CONFIGURATION_TYPES=Release \
+            -D DESKTOP_APP_ENABLE_LTO=OFF \
+            -D TDESKTOP_API_ID="$TDESKTOP_API_ID" \
+            -D TDESKTOP_API_HASH="$TDESKTOP_API_HASH" \
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON \
+            -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+      - name: Package Linux
+        run: |
+          test -x out/Release/Telegram
+          mkdir -p dist
+          tar -cJf dist/tdesktop-without-widgets-linux-x64.tar.xz -C out/Release Telegram
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-linux
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows x64
+    needs: version
+    runs-on: windows-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+          path: tdesktop
+      - name: Prepare dependency tools
+        run: |
+          sdk=$(sed -n 's/.*\*\*\(.*\)\*\* SDK version.*/\1/p' tdesktop/docs/building-win.md)
+          test -n "$sdk"
+          echo "SDK=$sdk" >> "$GITHUB_ENV"
+          git config --global user.email 'build@users.noreply.github.com'
+          git config --global user.name 'Release build'
+      - name: Native tools
+        uses: Eden-CI/msvc-dev-cmd@1bd71f95d6f3d1b2b3395b335cc63bcdc90cf223
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: '14.44'
+      - name: NuGet sources
+        shell: cmd
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+      - name: Dependencies cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            Libraries
+            ThirdParty
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ env.SDK }}-${{ hashFiles('tdesktop/Telegram/build/prepare/**', 'tdesktop/Telegram/build/qt_version.py') }}
+      - name: Build dependencies for Debug and Release
+        shell: cmd
+        run: call tdesktop\Telegram\build\prepare\win.bat silent qt6
+      - name: Build Release
+        shell: cmd
+        run: |
+          cd tdesktop\Telegram
+          call configure.bat x64 qt6 ^
+            -D CMAKE_CONFIGURATION_TYPES=Release ^
+            -D DESKTOP_APP_ENABLE_LTO=OFF ^
+            -D TDESKTOP_API_ID=%TDESKTOP_API_ID% ^
+            -D TDESKTOP_API_HASH=%TDESKTOP_API_HASH% ^
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
+            -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+          if errorlevel 1 exit /b 1
+          cmake --build ..\out --config Release --parallel
+      - name: Package Windows
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Compress-Archive -Path tdesktop/out/Release/Telegram.exe -DestinationPath dist/tdesktop-without-widgets-windows-x64.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-windows
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  macos:
+    name: macOS universal
+    needs: version
+    runs-on: macos-latest
+    timeout-minutes: 360
+    env:
+      TDESKTOP_MAC_TOOLCHAIN: system
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+          path: tdesktop
+      - name: Prepare dependency tools
+        run: |
+          brew install automake libtool meson nasm ninja pkg-config
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          {
+            xcodebuild -version
+            xcrun clang --version
+          } > "$RUNNER_TEMP/toolchain.txt"
+          echo "TOOLCHAIN_KEY=$(shasum -a 256 "$RUNNER_TEMP/toolchain.txt" | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
+      - name: Dependencies cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            Libraries
+            ThirdParty
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ env.TOOLCHAIN_KEY }}-${{ hashFiles('tdesktop/Telegram/build/prepare/**', 'tdesktop/Telegram/build/qt_version.py') }}
+      - name: Build dependencies for Debug and Release
+        run: bash tdesktop/Telegram/build/prepare/mac.sh silent
+      - name: Build Release
+        run: |
+          cd tdesktop/Telegram
+          ./configure.sh \
+            -D CMAKE_CONFIGURATION_TYPES=Release \
+            -D 'CMAKE_OSX_ARCHITECTURES=x86_64;arm64' \
+            -D CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+            -D DESKTOP_APP_ENABLE_LTO=OFF \
+            -D TDESKTOP_API_ID="$TDESKTOP_API_ID" \
+            -D TDESKTOP_API_HASH="$TDESKTOP_API_HASH" \
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON \
+            -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+          cmake --build ../out --config Release --parallel
+      - name: Package macOS
+        run: |
+          lipo -verify_arch x86_64 arm64 tdesktop/out/Release/Telegram.app/Contents/MacOS/Telegram
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent tdesktop/out/Release/Telegram.app dist/tdesktop-without-widgets-macos-universal.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-macos
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish release
+    needs: [version, linux, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Publish archives and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          test -s tdesktop-without-widgets-linux-x64.tar.xz
+          test -s tdesktop-without-widgets-windows-x64.zip
+          test -s tdesktop-without-widgets-macos-universal.zip
+          sha256sum *.tar.xz *.zip > SHA256SUMS
+          cat > "$RUNNER_TEMP/release-notes.txt" <<EOF
+          Community builds of Telegram Desktop without widgets.
+
+          Windows x64, macOS universal (Intel and Apple Silicon), and Linux x64.
+          These builds are unsigned and macOS builds are not notarized.
+          Automatic updates and crash reporting are disabled.
+
+          Source commit: $GITHUB_SHA
+          Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          EOF
+          args=()
+          if [[ "$PRERELEASE" == true ]]; then args+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" ./*.tar.xz ./*.zip SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Telegram Desktop without widgets $RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.txt" \
+            "${args[@]}"
