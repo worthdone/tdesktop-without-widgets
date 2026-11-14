@@ -1,0 +1,145 @@
+name: Release Windows x64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Public credentials already used by this repository's nightly builds.
+  TDESKTOP_API_ID: '611335'
+  TDESKTOP_API_HASH: d524b414d21f4d37f08684c1df41ac9c
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+          path: tdesktop
+      - name: Prepare dependency tools
+        run: |
+          sdk=$(sed -n 's/.*\*\*\(.*\)\*\* SDK version.*/\1/p' tdesktop/docs/building-win.md)
+          test -n "$sdk"
+          echo "SDK=$sdk" >> "$GITHUB_ENV"
+          git config --global user.email 'build@users.noreply.github.com'
+          git config --global user.name 'Release build'
+      - name: Install ATL for the pinned MSVC toolset
+        shell: pwsh
+        run: |
+          $installer = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
+          $vswhere = Join-Path $installer 'vswhere.exe'
+          $setup = Join-Path $installer 'setup.exe'
+          if (-not (Test-Path $vswhere) -or -not (Test-Path $setup)) {
+            throw "Visual Studio Installer is incomplete at $installer."
+          }
+
+          $toolsComponent = 'Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64'
+          $atlComponent = 'Microsoft.VisualStudio.Component.VC.14.44.17.14.ATL'
+          $path = @(& $vswhere -latest -products '*' -requires $toolsComponent -property installationPath)[0]
+          if (-not $path) {
+            throw "No Visual Studio instance provides $toolsComponent."
+          }
+
+          $toolset = Get-ChildItem (Join-Path $path 'VC\Tools\MSVC') -Directory `
+            | Where-Object { $_.Name -like '14.44.*' } `
+            | Sort-Object Name -Descending `
+            | Select-Object -First 1
+          if (-not $toolset) {
+            throw "The selected Visual Studio instance has no 14.44 toolset."
+          }
+          $header = Join-Path $toolset.FullName 'atlmfc\include\atlbase.h'
+          if (-not (Test-Path $header)) {
+            $process = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+              'modify',
+              '--installPath', "`"$path`"",
+              '--add', $atlComponent,
+              '--quiet', '--norestart', '--nocache'
+            )
+            if ($process.ExitCode -notin @(0, 3010)) {
+              throw "Visual Studio Installer exited with $($process.ExitCode)."
+            }
+          }
+          if (-not (Test-Path $header)) {
+            throw "$atlComponent did not install $header."
+          }
+      - name: Native tools
+        uses: Eden-CI/msvc-dev-cmd@1bd71f95d6f3d1b2b3395b335cc63bcdc90cf223
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: '14.44'
+      - name: Verify ATL headers in the selected toolset
+        shell: pwsh
+        run: |
+          $atlInclude = Join-Path $env:VCToolsInstallDir 'atlmfc\include'
+          foreach ($header in @('atlbase.h', 'atlcomcli.h')) {
+            if (-not (Test-Path (Join-Path $atlInclude $header))) {
+              throw "The selected toolset has no $header in $atlInclude."
+            }
+          }
+          if (($env:INCLUDE -split ';') -notcontains $atlInclude) {
+            throw "The selected toolset did not add $atlInclude to INCLUDE."
+          }
+      - name: NuGet sources
+        shell: cmd
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+      - name: Dependencies cache
+        id: windows-dependencies
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            Libraries
+            ThirdParty
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ env.SDK }}-${{ hashFiles('tdesktop/Telegram/build/prepare/**', 'tdesktop/Telegram/build/qt_version.py') }}
+      - name: Build dependencies for Debug and Release
+        shell: cmd
+        run: call tdesktop\Telegram\build\prepare\win.bat silent qt6
+      - name: Save completed dependencies before compiling the application
+        if: steps.windows-dependencies.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            Libraries
+            ThirdParty
+          key: ${{ steps.windows-dependencies.outputs.cache-primary-key }}
+      - name: Build Release
+        shell: cmd
+        env:
+          _CL_: /MP1
+        run: |
+          cd tdesktop\Telegram
+          call configure.bat x64 qt6 ^
+            -D CMAKE_CONFIGURATION_TYPES=Release ^
+            -D DESKTOP_APP_ENABLE_LTO=OFF ^
+            -D TDESKTOP_API_ID=%TDESKTOP_API_ID% ^
+            -D TDESKTOP_API_HASH=%TDESKTOP_API_HASH% ^
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
+            -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+          if errorlevel 1 exit /b 1
+          cmake --build ..\out --config Release --parallel 1 -- /p:CL_MPCount=1
+      - name: Package Windows
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Compress-Archive -Path tdesktop/out/Release/Telegram.exe -DestinationPath dist/tdesktop-without-widgets-windows-x64.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-windows
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30

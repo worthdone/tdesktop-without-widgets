@@ -1,0 +1,71 @@
+name: Release macOS universal
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Public credentials already used by this repository's nightly builds.
+  TDESKTOP_API_ID: '611335'
+  TDESKTOP_API_HASH: d524b414d21f4d37f08684c1df41ac9c
+
+jobs:
+  macos:
+    name: macOS universal
+    runs-on: macos-latest
+    timeout-minutes: 360
+    env:
+      TDESKTOP_MAC_TOOLCHAIN: system
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+          path: tdesktop
+      - name: Prepare dependency tools
+        run: |
+          brew install automake libtool meson nasm ninja pkg-config
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          {
+            xcodebuild -version
+            xcrun clang --version
+          } > "$RUNNER_TEMP/toolchain.txt"
+          echo "TOOLCHAIN_KEY=$(shasum -a 256 "$RUNNER_TEMP/toolchain.txt" | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
+      - name: Dependencies cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            Libraries
+            ThirdParty
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ env.TOOLCHAIN_KEY }}-${{ hashFiles('tdesktop/Telegram/build/prepare/**', 'tdesktop/Telegram/build/qt_version.py') }}
+      - name: Build dependencies for Debug and Release
+        run: bash tdesktop/Telegram/build/prepare/mac.sh silent
+      - name: Build Release
+        run: |
+          cd tdesktop/Telegram
+          ./configure.sh \
+            -D CMAKE_CONFIGURATION_TYPES=Release \
+            -D 'CMAKE_OSX_ARCHITECTURES=x86_64;arm64' \
+            -D CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+            -D DESKTOP_APP_ENABLE_LTO=OFF \
+            -D TDESKTOP_API_ID="$TDESKTOP_API_ID" \
+            -D TDESKTOP_API_HASH="$TDESKTOP_API_HASH" \
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON \
+            -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+          cmake --build ../out --config Release --parallel
+      - name: Package macOS
+        run: |
+          lipo tdesktop/out/Release/Telegram.app/Contents/MacOS/Telegram -verify_arch x86_64 arm64
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent tdesktop/out/Release/Telegram.app dist/tdesktop-without-widgets-macos-universal.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-macos
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
