@@ -27,6 +27,11 @@ and macOS packages, pass the original full source commit:
 gh workflow run release-windows.yml --ref dev -f source_sha=<full-source-sha>
 ```
 
+If that run already built dependencies before a workflow fix, also pass
+`-f dependencies_run=<run-id>` to reuse its dependency artifact. It must
+contain dependencies for the same source commit and still be within the
+one-day retention period.
+
 The Windows build records the checked-out source SHA separately from the
 workflow commit. The publisher verifies this metadata and requires every
 package to have the same source SHA. Earlier builds without metadata use
