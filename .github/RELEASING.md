@@ -4,13 +4,33 @@ Dispatch `release-linux.yml`, `release-windows.yml` and `release-macos.yml` on
 `dev`. Each workflow builds independently and keeps its package for 30 days.
 Retry a failed OS workflow without rerunning successful builds. All three
 packages must come from successful manual builds of the same source commit
-on the default branch.
+using workflow definitions from the default branch.
 
 ```sh
 gh workflow run release-linux.yml --ref dev
 gh workflow run release-windows.yml --ref dev
 gh workflow run release-macos.yml --ref dev
 ```
+
+Windows dependencies and application compilation run in separate jobs, each
+with its own six-hour budget. Completed dependencies transfer as a compressed
+artifact retained for one day. If compilation fails, rerun only failed jobs:
+
+```sh
+gh api --method POST repos/worthdone/tdesktop-without-widgets/actions/runs/<run-id>/rerun-failed-jobs
+```
+
+To retry Windows using newer workflow fixes while keeping successful Linux
+and macOS packages, pass the original full source commit:
+
+```sh
+gh workflow run release-windows.yml --ref dev -f source_sha=<full-source-sha>
+```
+
+The Windows build records the checked-out source SHA separately from the
+workflow commit. The publisher verifies this metadata and requires every
+package to have the same source SHA. Earlier builds without metadata use
+their workflow commit as their source commit.
 
 The publisher runs after each successful OS build. Once all three packages
 are available, it creates a prerelease tagged
@@ -29,3 +49,6 @@ be resumed by rerunning the publisher with the same source commit and tag.
 These packages are unsigned, and the macOS app is not notarized. Immutability
 does not provide platform code signing or reproducible builds. The release
 notes link each OS build and identify the common source commit.
+
+Run publisher checks from the repository root with
+`python3 .github/scripts/test_publish_release.py`.

@@ -43,10 +43,9 @@ def pages(path, key=None):
     raise RuntimeError("API pagination limit reached")
 
 
-def trusted_run(run, repo, branch, sha, platform):
+def trusted_run(run, repo, branch, platform):
     return (
-        run["head_sha"] == sha
-        and run["head_branch"] == branch
+        run["head_branch"] == branch
         and run["head_repository"]["full_name"] == repo
         and run["event"] == "workflow_dispatch"
         and run["status"] == "completed"
@@ -55,29 +54,61 @@ def trusted_run(run, repo, branch, sha, platform):
     )
 
 
+def source_commit(run, repo, platform):
+    artifacts = pages(f"repos/{repo}/actions/runs/{run['id']}/artifacts", "artifacts")
+    metadata = [item for item in artifacts if item["name"] == f"release-{platform}-source"]
+    if not metadata:
+        return run["head_sha"]
+    if len(metadata) != 1 or metadata[0]["expired"]:
+        return None
+    with tempfile.TemporaryDirectory() as directory:
+        gh("run", "download", str(run["id"]), "--repo", repo,
+           "--name", f"release-{platform}-source", "--dir", directory)
+        path = Path(directory) / "source.json"
+        if list(Path(directory).iterdir()) != [path] or path.stat().st_size > 1024:
+            raise RuntimeError("Unexpected source metadata contents")
+        sha = json.loads(path.read_text())["sha"]
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise ValueError("Invalid source commit metadata")
+        return sha
+
+
 def main():
     repo = os.environ["GITHUB_REPOSITORY"]
     root = f"repos/{repo}"
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     automatic = os.environ["GITHUB_EVENT_NAME"] == "workflow_run"
     branch = event["repository"]["default_branch"]
-    source = event["workflow_run"]["head_sha"] if automatic else os.environ.get("SOURCE_SHA", "")
+    if automatic:
+        trigger = event["workflow_run"]
+        platform = next((name for name in PACKAGES
+                         if trigger["path"] == f".github/workflows/release-{name}.yml"), None)
+        if not platform or not trusted_run(trigger, repo, branch, platform):
+            print("Ignoring an untrusted build event.")
+            return
+        source = source_commit(trigger, repo, platform)
+        if not source:
+            raise RuntimeError("Source commit metadata is unavailable")
+    else:
+        source = os.environ.get("SOURCE_SHA", "")
     sha = source or api(f"{root}/commits/{branch}")["sha"]
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise ValueError("A full source commit SHA is required")
 
     builds = {}
     for platform in PACKAGES:
-        path = f"{root}/actions/workflows/release-{platform}.yml/runs?head_sha={sha}&event=workflow_dispatch"
+        path = f"{root}/actions/workflows/release-{platform}.yml/runs?branch={branch}&event=workflow_dispatch&status=success"
         candidates = [run for run in pages(path, "workflow_runs")
-                      if trusted_run(run, repo, branch, sha, platform)]
-        if not candidates:
+                      if trusted_run(run, repo, branch, platform)]
+        build = next((run for run in sorted(candidates, key=lambda run: run["id"], reverse=True)
+                      if source_commit(run, repo, platform) == sha), None)
+        if not build:
             message = f"Waiting for a successful {platform} build of {sha}."
             if automatic:
                 print(message)
                 return
             raise RuntimeError(message)
-        builds[platform] = max(candidates, key=lambda run: run["id"])
+        builds[platform] = build
 
     version_file = api(f"{root}/contents/Telegram/build/version?ref={sha}")
     version_text = base64.b64decode(version_file["content"]).decode()
@@ -139,6 +170,9 @@ def main():
                 args.append("--prerelease")
             gh(*args)
             release = next(item for item in pages(f"{root}/releases") if item["tag_name"] == tag)
+        else:
+            gh("api", "--method", "PATCH", f"{root}/releases/{release['id']}",
+               "-F", f"body=@{notes}")
         expected = [*PACKAGES.values(), "SHA256SUMS"]
         gh("release", "upload", tag, "--repo", repo, "--clobber",
            *(str(dist / filename) for filename in expected))

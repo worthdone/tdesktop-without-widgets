@@ -2,6 +2,11 @@ name: Release Windows x64
 
 on:
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full source commit (empty uses this workflow commit)
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -11,112 +16,72 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
   # Public credentials already used by this repository's nightly builds.
   TDESKTOP_API_ID: '611335'
   TDESKTOP_API_HASH: d524b414d21f4d37f08684c1df41ac9c
 
 jobs:
-  windows:
-    name: Windows x64
+  dependencies:
+    name: Windows dependencies
     runs-on: windows-latest
     timeout-minutes: 360
-    defaults:
-      run:
-        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          path: automation
+          sparse-checkout: .github/actions/release-windows-setup
+          persist-credentials: false
+      - name: Validate source commit
+        shell: bash
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.SOURCE_SHA }}
           submodules: recursive
           path: tdesktop
-      - name: Prepare dependency tools
-        run: |
-          sdk=$(sed -n 's/.*\*\*\(.*\)\*\* SDK version.*/\1/p' tdesktop/docs/building-win.md)
-          test -n "$sdk"
-          echo "SDK=$sdk" >> "$GITHUB_ENV"
-          git config --global user.email 'build@users.noreply.github.com'
-          git config --global user.name 'Release build'
-      - name: Install ATL for the pinned MSVC toolset
-        shell: pwsh
-        run: |
-          $installer = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
-          $vswhere = Join-Path $installer 'vswhere.exe'
-          $setup = Join-Path $installer 'setup.exe'
-          if (-not (Test-Path $vswhere) -or -not (Test-Path $setup)) {
-            throw "Visual Studio Installer is incomplete at $installer."
-          }
-
-          $toolsComponent = 'Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64'
-          $atlComponent = 'Microsoft.VisualStudio.Component.VC.14.44.17.14.ATL'
-          $path = @(& $vswhere -latest -products '*' -requires $toolsComponent -property installationPath)[0]
-          if (-not $path) {
-            throw "No Visual Studio instance provides $toolsComponent."
-          }
-
-          $toolset = Get-ChildItem (Join-Path $path 'VC\Tools\MSVC') -Directory `
-            | Where-Object { $_.Name -like '14.44.*' } `
-            | Sort-Object Name -Descending `
-            | Select-Object -First 1
-          if (-not $toolset) {
-            throw "The selected Visual Studio instance has no 14.44 toolset."
-          }
-          $header = Join-Path $toolset.FullName 'atlmfc\include\atlbase.h'
-          if (-not (Test-Path $header)) {
-            $process = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
-              'modify',
-              '--installPath', "`"$path`"",
-              '--add', $atlComponent,
-              '--quiet', '--norestart', '--nocache'
-            )
-            if ($process.ExitCode -notin @(0, 3010)) {
-              throw "Visual Studio Installer exited with $($process.ExitCode)."
-            }
-          }
-          if (-not (Test-Path $header)) {
-            throw "$atlComponent did not install $header."
-          }
-      - name: Native tools
-        uses: Eden-CI/msvc-dev-cmd@1bd71f95d6f3d1b2b3395b335cc63bcdc90cf223
-        with:
-          arch: x64
-          sdk: ${{ env.SDK }}
-          toolset: '14.44'
-      - name: Verify ATL headers in the selected toolset
-        shell: pwsh
-        run: |
-          $atlInclude = Join-Path $env:VCToolsInstallDir 'atlmfc\include'
-          foreach ($header in @('atlbase.h', 'atlcomcli.h')) {
-            if (-not (Test-Path (Join-Path $atlInclude $header))) {
-              throw "The selected toolset has no $header in $atlInclude."
-            }
-          }
-          if (($env:INCLUDE -split ';') -notcontains $atlInclude) {
-            throw "The selected toolset did not add $atlInclude to INCLUDE."
-          }
-      - name: NuGet sources
-        shell: cmd
-        run: |
-          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
-          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
-      - name: Dependencies cache
-        id: windows-dependencies
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            Libraries
-            ThirdParty
-          key: release-${{ runner.os }}-${{ runner.arch }}-${{ env.SDK }}-${{ hashFiles('tdesktop/Telegram/build/prepare/**', 'tdesktop/Telegram/build/qt_version.py') }}
+      - uses: ./automation/.github/actions/release-windows-setup
       - name: Build dependencies for Debug and Release
         shell: cmd
         run: call tdesktop\Telegram\build\prepare\win.bat silent qt6
-      - name: Save completed dependencies before compiling the application
-        if: steps.windows-dependencies.outputs.cache-hit != 'true'
-        continue-on-error: true
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Archive completed dependencies
+        shell: bash
+        run: tar --use-compress-program='zstd -T0 -3' --force-local -cf "$RUNNER_TEMP/windows-dependencies.tar.zst" Libraries ThirdParty
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          path: |
-            Libraries
-            ThirdParty
-          key: ${{ steps.windows-dependencies.outputs.cache-primary-key }}
+          name: windows-dependencies
+          path: ${{ runner.temp }}/windows-dependencies.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  windows:
+    name: Windows x64
+    needs: dependencies
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: automation
+          sparse-checkout: .github/actions/release-windows-setup
+          persist-credentials: false
+      - name: Validate source commit
+        shell: bash
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          submodules: recursive
+          path: tdesktop
+      - uses: ./automation/.github/actions/release-windows-setup
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: windows-dependencies
+          path: ${{ runner.temp }}/dependencies
+      - name: Restore completed dependencies
+        shell: bash
+        run: tar --use-compress-program='zstd -d' --force-local -xf "$RUNNER_TEMP/dependencies/windows-dependencies.tar.zst"
       - name: Build Release
         shell: cmd
         env:
@@ -141,5 +106,18 @@ jobs:
         with:
           name: release-windows
           path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Record the source commit
+        shell: bash
+        run: |
+          actual=$(git -C tdesktop rev-parse HEAD)
+          test "$actual" = "$SOURCE_SHA"
+          mkdir -p source
+          printf '{"sha":"%s"}\n' "$actual" > source/source.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-windows-source
+          path: source/source.json
           if-no-files-found: error
           retention-days: 30
