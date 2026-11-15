@@ -1,5 +1,9 @@
 # Releases
 
+Only the three manual OS release builds, their publisher and the manual Snap
+build are enabled in this fork. Pushes, pull requests, schedules and release
+hooks do not start upstream CI, issue bots or dependency update automation.
+
 Dispatch `release-linux.yml`, `release-windows.yml` and `release-macos.yml` on
 `dev`. Each workflow builds independently and keeps its package for 30 days.
 Retry a failed OS workflow without rerunning successful builds. All three
