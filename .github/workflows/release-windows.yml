@@ -96,13 +96,36 @@ jobs:
             echo 'Retrying extraction after restoring forward symlink targets.'
             tar --use-compress-program='zstd -d' --force-local -xf "$archive"
           fi
+          rm -- "$archive"
+      - name: Inspect available build memory and disk
+        shell: pwsh
+        run: |
+          Get-PSDrive -Name C,D | Select-Object Name,Free,Used
+          Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,TotalVirtualMemorySize,FreeVirtualMemory
+      - name: Reserve virtual memory for compilation
+        uses: al-cheb/configure-pagefile-action@a3b6ebd6b634da88790d9c58d4b37a7f4a7b8708
+        with:
+          minimum-size: 16GB
+          maximum-size: 32GB
+          disk-root: 'D:'
+      - name: Verify compiler memory headroom
+        shell: pwsh
+        run: |
+          $memory = Get-CimInstance Win32_OperatingSystem
+          $memory | Select-Object TotalVisibleMemorySize,TotalVirtualMemorySize,FreeVirtualMemory
+          Get-CimInstance Win32_PageFileUsage | Select-Object Name,AllocatedBaseSize,CurrentUsage
+          if ($memory.TotalVirtualMemorySize -lt ($memory.TotalVisibleMemorySize + 16GB / 1KB)) {
+            throw 'The runner did not allocate the required compiler paging space.'
+          }
       - name: Build Release
         shell: cmd
         env:
-          _CL_: /MP1
+          _CL_: /MP1 /FS
         run: |
           cd tdesktop\Telegram
-          call configure.bat x64 qt6 ^
+          where cl
+          where ninja
+          call configure.bat -G "Ninja Multi-Config" qt6 ^
             -D CMAKE_CONFIGURATION_TYPES=Release ^
             -D DESKTOP_APP_ENABLE_LTO=OFF ^
             -D TDESKTOP_API_ID=%TDESKTOP_API_ID% ^
@@ -110,7 +133,7 @@ jobs:
             -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
             -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
           if errorlevel 1 exit /b 1
-          cmake --build ..\out --config Release --parallel 1 -- /p:CL_MPCount=1
+          cmake --build ..\out --config Release --target Telegram --parallel 2
       - name: Package Windows
         shell: pwsh
         run: |

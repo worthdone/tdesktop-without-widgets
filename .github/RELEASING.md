@@ -18,7 +18,9 @@ gh workflow run release-macos.yml --ref dev
 
 Windows dependencies and application compilation run in separate jobs, each
 with its own six-hour budget. Completed dependencies transfer as a compressed
-artifact retained for one day. If compilation fails, rerun only failed jobs:
+artifact retained for one day. Compilation uses Ninja with two concurrent
+source files and a 16–32 GB paging file. Compiler processes exit after each
+source file, releasing their heaps. If compilation fails, rerun only failed jobs:
 
 ```sh
 gh api --method POST repos/worthdone/tdesktop-without-widgets/actions/runs/<run-id>/rerun-failed-jobs
