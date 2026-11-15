@@ -172,7 +172,7 @@ def main():
             release = next(item for item in pages(f"{root}/releases") if item["tag_name"] == tag)
         else:
             gh("api", "--method", "PATCH", f"{root}/releases/{release['id']}",
-               "-F", f"body=@{notes}")
+               "-f", f"tag_name={tag}", "-F", f"body=@{notes}")
         expected = [*PACKAGES.values(), "SHA256SUMS"]
         gh("release", "upload", tag, "--repo", repo, "--clobber",
            *(str(dist / filename) for filename in expected))
@@ -184,7 +184,9 @@ def main():
             if asset["size"] != (dist / asset["name"]).stat().st_size or asset.get("digest") != digest:
                 raise RuntimeError(f"Uploaded asset verification failed: {asset['name']}")
         published = json.loads(gh("api", "--method", "PATCH", f"{root}/releases/{release['id']}",
-                                  "-F", "draft=false"))
+                                  "-f", f"tag_name={tag}", "-F", "draft=false"))
+        if published["tag_name"] != tag or published["target_commitish"] != sha:
+            raise RuntimeError("Published release source or tag does not match")
         if not published.get("immutable"):
             raise RuntimeError("Release was published but GitHub did not mark it immutable")
         print(published["html_url"])

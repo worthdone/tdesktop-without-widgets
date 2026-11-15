@@ -83,6 +83,8 @@ class PublisherTest(unittest.TestCase):
         elif args[:2] == ('release', 'create'):
             self.release = {'id': 10, 'tag_name': TAG, 'target_commitish': SHA, 'draft': True}
         elif args[:2] == ('release', 'upload'):
+            if self.release['tag_name'] != args[2]:
+                raise RuntimeError('Draft tag was lost during an update')
             for arg in args:
                 path = Path(arg)
                 if path.is_file():
@@ -90,6 +92,8 @@ class PublisherTest(unittest.TestCase):
             if self.bad_digest:
                 self.assets[0]['digest'] = 'sha256:wrong'
         elif args[:3] == ('api', '--method', 'PATCH'):
+            tag_fields = [arg for arg in args if arg.startswith('tag_name=')]
+            self.release['tag_name'] = tag_fields[0].split('=', 1)[1] if tag_fields else 'untagged-draft'
             if 'draft=false' in args:
                 self.release.update(draft=False, immutable=True, html_url='https://example.test/release')
             return json.dumps(self.release)
@@ -146,6 +150,8 @@ class PublisherTest(unittest.TestCase):
         self.release = {'id': 10, 'tag_name': TAG, 'target_commitish': SHA, 'draft': True}
         publisher.main()
         self.assertTrue(self.published())
+        self.assertEqual(self.release['tag_name'], TAG)
+        self.assertEqual(self.release['target_commitish'], SHA)
         self.assertFalse(any(call[:2] == ('release', 'create') for call in self.calls))
 
     def test_manual_missing_build_fails(self):
